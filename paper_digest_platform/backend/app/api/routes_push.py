@@ -8,6 +8,8 @@ from app.schemas.push import (
     DispatchLogItem,
     PaperRecordItem,
     RunNowRequest,
+    RunNowSubmitResponse,
+    RunNowTaskStatus,
     TestEmailRequest,
     TriggerResponse,
 )
@@ -36,29 +38,45 @@ async def send_test_email(
     return TriggerResponse(message=message, run_type="manual_test")
 
 
-@router.post("/run-now", response_model=TriggerResponse)
+@router.post("/run-now", response_model=RunNowSubmitResponse)
 async def run_digest_now(
     payload: RunNowRequest = Body(default_factory=RunNowRequest),
     user: UserIdentity = Depends(get_current_user),
     dispatch_service: DigestDispatchService = Depends(get_dispatch_service),
-) -> TriggerResponse:
+) -> RunNowSubmitResponse:
     try:
         logger.info(
             "run digest now start user_id=%s keywords_list=%s",
             user.id,
             payload.keywords_list,
         )
-        message = await dispatch_service.trigger_user_digest(
+        task = await dispatch_service.submit_manual_digest_task(
             user.id,
-            run_type="manual_digest",
-            force_send=True,
             keywords_list=payload.keywords_list,
         )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-    return TriggerResponse(message=message, run_type="manual_digest")
+    return RunNowSubmitResponse(
+        message="任务已提交，正在后台执行",
+        task=RunNowTaskStatus(**task),
+    )
+
+
+@router.get("/tasks/{task_id}", response_model=RunNowTaskStatus)
+async def get_run_now_task_status(
+    task_id: str,
+    user: UserIdentity = Depends(get_current_user),
+    dispatch_service: DigestDispatchService = Depends(get_dispatch_service),
+) -> RunNowTaskStatus:
+    task = dispatch_service.get_manual_digest_task(user_id=user.id, task_id=task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在或无权限访问",
+        )
+    return RunNowTaskStatus(**task)
 
 
 @router.get("/logs", response_model=list[DispatchLogItem])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,7 @@ class RunRequest:
     persist_state_to_file: bool = True
     user_search_intent: str = ""
     dispatch_run_type: str = "scheduled"
+    progress_callback: Callable[[str, str], None] | None = None
 
 
 class PaperDigestRunner:
@@ -51,6 +53,7 @@ class PaperDigestRunner:
             persist_state_to_file=request.persist_state_to_file,
             profile=request.user_search_intent,
             dispatch_run_type=request.dispatch_run_type,
+            progress_callback=request.progress_callback,
         )
 
 
@@ -69,6 +72,7 @@ def run_once(
     persist_state_to_file: bool = True,
     user_search_intent: str = "",
     dispatch_run_type: str = "scheduled",
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> None:
     """兼容旧签名的函数式入口。"""
     request = RunRequest(
@@ -83,6 +87,7 @@ def run_once(
         persist_state_to_file=persist_state_to_file,
         user_search_intent=user_search_intent,
         dispatch_run_type=dispatch_run_type,
+        progress_callback=progress_callback,
     )
     _default_runner.run(request)
 

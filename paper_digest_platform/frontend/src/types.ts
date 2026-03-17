@@ -65,6 +65,25 @@ export interface TriggerResponse {
   run_type: string;
 }
 
+export interface RunNowTaskStatus {
+  task_id: string;
+  run_type: string;
+  status: "queued" | "running" | "success" | "failed" | string;
+  progress_stage: string;
+  progress_message: string;
+  result_message: string;
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string;
+  finished_at: string;
+}
+
+export interface RunNowSubmitResponse {
+  message: string;
+  task: RunNowTaskStatus;
+}
+
 export interface PaperRecordItem {
   id: number;
   uid: string;

@@ -6,6 +6,10 @@ import json
 import logging
 import re
 import tempfile
+import threading
+import uuid
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,10 @@ class DigestDispatchService:
         self._semaphore = asyncio.Semaphore(
             max(1, int(self._settings.dispatch_max_concurrency))
         )
+        self._task_lock = threading.Lock()
+        self._manual_tasks: dict[str, dict[str, Any]] = {}
+        self._manual_task_keep_hours = 24
+        self._manual_task_keep_max = 200
 
     async def trigger_user_digest(
         self,
@@ -35,7 +43,9 @@ class DigestDispatchService:
         run_type: str,
         force_send: bool = False,
         keywords_list: list[list[str]] | None = None,
+        progress_callback: Callable[[str, str], None] | None = None,
     ) -> str:
+        self._emit_progress(progress_callback, "prepare", "读取推送配置中")
         logger.info(
             "digest trigger start user_id=%s run_type=%s force_send=%s keywords_list=%s",
             user_id,
@@ -80,9 +90,11 @@ class DigestDispatchService:
                     state_snapshot,
                     user_search_intent=profile.get("user_search_intent", ""),
                     dispatch_run_type=run_type,
+                    progress_callback=progress_callback,
                 )
         except Exception as exc:
             message = f"推送失败：{exc}"
+            self._emit_progress(progress_callback, "failed", message)
             logger.exception(
                 "digest trigger failed user_id=%s run_type=%s", user_id, run_type
             )
@@ -111,7 +123,126 @@ class DigestDispatchService:
         await self._settings_service.add_dispatch_log(
             user_id, run_type, "success", message
         )
+        self._emit_progress(progress_callback, "completed", message)
         return message
+
+    async def submit_manual_digest_task(
+        self,
+        user_id: int,
+        *,
+        keywords_list: list[list[str]] | None = None,
+    ) -> dict[str, Any]:
+        profile = await self._settings_service.get_user_dispatch_profile(user_id)
+        effective_keywords_list = self._effective_keywords_list(profile, keywords_list)
+        self._validate_profile(
+            profile,
+            for_digest=True,
+            require_active=False,
+            keywords_list=effective_keywords_list,
+        )
+
+        now = self._now_iso()
+        task_id = uuid.uuid4().hex
+        task = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "run_type": "manual_digest",
+            "status": "queued",
+            "progress_stage": "queued",
+            "progress_message": "任务已排队，等待执行",
+            "result_message": "",
+            "error_message": "",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+        }
+        with self._task_lock:
+            self._manual_tasks[task_id] = task
+            self._prune_manual_tasks_locked()
+
+        logger.info(
+            "manual digest task queued user_id=%s task_id=%s groups=%s",
+            user_id,
+            task_id,
+            len(effective_keywords_list),
+        )
+        asyncio.create_task(
+            self._run_manual_digest_task(
+                task_id=task_id,
+                user_id=user_id,
+                keywords_list=effective_keywords_list,
+            )
+        )
+        return task.copy()
+
+    def get_manual_digest_task(
+        self,
+        *,
+        user_id: int,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        with self._task_lock:
+            task = self._manual_tasks.get(task_id)
+            if not task:
+                return None
+            if int(task.get("user_id") or 0) != int(user_id):
+                return None
+            return task.copy()
+
+    async def _run_manual_digest_task(
+        self,
+        *,
+        task_id: str,
+        user_id: int,
+        keywords_list: list[list[str]],
+    ) -> None:
+        started_at = self._now_iso()
+        self._update_task(
+            task_id,
+            status="running",
+            progress_stage="running",
+            progress_message="任务启动，准备检索论文",
+            started_at=started_at,
+        )
+
+        try:
+            message = await self.trigger_user_digest(
+                user_id,
+                run_type="manual_digest",
+                force_send=True,
+                keywords_list=keywords_list,
+                progress_callback=lambda stage, msg: self._set_task_progress(
+                    task_id, stage, msg
+                ),
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            self._update_task(
+                task_id,
+                status="failed",
+                progress_stage="failed",
+                progress_message="执行失败",
+                error_message=error_message,
+                finished_at=self._now_iso(),
+            )
+            logger.warning(
+                "manual digest task failed user_id=%s task_id=%s error=%s",
+                user_id,
+                task_id,
+                error_message,
+            )
+            return
+
+        self._update_task(
+            task_id,
+            status="success",
+            progress_stage="completed",
+            progress_message="执行完成",
+            result_message=message,
+            finished_at=self._now_iso(),
+        )
+        logger.info("manual digest task success user_id=%s task_id=%s", user_id, task_id)
 
     async def send_test_email(
         self, user_id: int, *, to_email: str | None = None
@@ -394,6 +525,7 @@ class DigestDispatchService:
         state_snapshot: dict[str, Any],
         user_search_intent: str,
         dispatch_run_type: str,
+        progress_callback: Callable[[str, str], None] | None = None,
     ) -> None:
         try:
             from app.paper_digest.runner import run_once
@@ -426,10 +558,80 @@ class DigestDispatchService:
                 persist_state_to_file=False,
                 user_search_intent=user_search_intent,
                 dispatch_run_type=dispatch_run_type,
+                progress_callback=progress_callback,
             )
         finally:
             if tmp_config_path and tmp_config_path.exists():
                 tmp_config_path.unlink(missing_ok=True)
+
+    def _emit_progress(
+        self,
+        progress_callback: Callable[[str, str], None] | None,
+        stage: str,
+        message: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage, message)
+        except Exception:
+            logger.debug("emit progress failed stage=%s", stage, exc_info=True)
+
+    def _set_task_progress(self, task_id: str, stage: str, message: str) -> None:
+        with self._task_lock:
+            task = self._manual_tasks.get(task_id)
+            if not task:
+                return
+            if str(task.get("status") or "") not in {"queued", "running"}:
+                return
+            task["progress_stage"] = str(stage or "").strip() or "running"
+            task["progress_message"] = str(message or "").strip() or "任务执行中"
+            task["updated_at"] = self._now_iso()
+
+    def _update_task(self, task_id: str, **fields: Any) -> None:
+        with self._task_lock:
+            task = self._manual_tasks.get(task_id)
+            if not task:
+                return
+            task.update(fields)
+            task["updated_at"] = self._now_iso()
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    def _prune_manual_tasks_locked(self) -> None:
+        now = datetime.now(timezone.utc)
+        expire_before = now - timedelta(hours=max(1, self._manual_task_keep_hours))
+
+        expired_ids: list[str] = []
+        for task_id, task in self._manual_tasks.items():
+            updated_at_raw = str(task.get("updated_at") or "").strip()
+            try:
+                updated_at = datetime.fromisoformat(updated_at_raw)
+            except Exception:
+                updated_at = now
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            if updated_at < expire_before:
+                expired_ids.append(task_id)
+
+        for task_id in expired_ids:
+            self._manual_tasks.pop(task_id, None)
+
+        if len(self._manual_tasks) <= self._manual_task_keep_max:
+            return
+
+        ordered = sorted(
+            self._manual_tasks.items(),
+            key=lambda item: str(item[1].get("updated_at") or ""),
+            reverse=True,
+        )
+        keep_ids = {
+            task_id for task_id, _ in ordered[: max(1, self._manual_task_keep_max)]
+        }
+        for task_id in list(self._manual_tasks.keys()):
+            if task_id not in keep_ids:
+                self._manual_tasks.pop(task_id, None)
 
     def _history_key_set_from_state(
         self, state: dict[str, Any]

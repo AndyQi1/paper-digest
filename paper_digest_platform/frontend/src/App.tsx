@@ -6,6 +6,8 @@ import type {
   DigestSettingsResponse,
   DispatchLogItem,
   FeedbackItem,
+  RunNowSubmitResponse,
+  RunNowTaskStatus,
   FeedbackSubmitResponse,
   LoginResponse,
   MessageResponse,
@@ -155,6 +157,7 @@ export default function App() {
   const [papers, setPapers] = useState<PaperRecordItem[]>([]);
   const [feedbackItems, setFeedbackItems] = useState<FeedbackItem[]>([]);
   const [feedbackContent, setFeedbackContent] = useState<string>("");
+  const [runNowTask, setRunNowTask] = useState<RunNowTaskStatus | null>(null);
   const [smtpReady, setSmtpReady] = useState<boolean>(false);
   const [senderEmail, setSenderEmail] = useState<string>("");
   const [keywordIntent, setKeywordIntent] = useState<string>("");
@@ -185,6 +188,8 @@ export default function App() {
   const successRuns = digestLogs.filter((item) => item.status === "success").length;
   const failedRuns = digestLogs.filter((item) => item.status === "failed").length;
   const successRate = totalRuns > 0 ? Math.round((successRuns / totalRuns) * 100) : 0;
+  const runNowInFlight =
+    runNowTask !== null && (runNowTask.status === "queued" || runNowTask.status === "running");
 
   const showToast = (message: string, error = false) => {
     setToast({ message, error, visible: true });
@@ -271,6 +276,76 @@ export default function App() {
       cancelled = true;
     };
   }, [authToken]);
+
+  useEffect(() => {
+    if (!authToken || !runNowTask?.task_id) {
+      return undefined;
+    }
+    if (runNowTask.status === "success" || runNowTask.status === "failed") {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const pollTask = async () => {
+      try {
+        const latest = await apiRequest<RunNowTaskStatus>(`/push/tasks/${runNowTask.task_id}`, {
+          token: authToken,
+        });
+        if (cancelled) {
+          return;
+        }
+        setRunNowTask(latest);
+
+        if (latest.status === "success") {
+          showToast(latest.result_message || "推送任务执行完成");
+          await loadDashboardData(authToken);
+          return;
+        }
+        if (latest.status === "failed") {
+          showToast(latest.error_message || "推送任务执行失败", true);
+          await loadDashboardData(authToken);
+          return;
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = errorMessage(error);
+          showToast(message, true);
+          setRunNowTask((previous) => {
+            if (!previous) {
+              return previous;
+            }
+            return {
+              ...previous,
+              status: "failed",
+              progress_stage: "failed",
+              progress_message: "任务状态查询失败",
+              error_message: message,
+            };
+          });
+        }
+        return;
+      }
+
+      if (!cancelled) {
+        timer = window.setTimeout(() => {
+          void pollTask();
+        }, 2000);
+      }
+    };
+
+    timer = window.setTimeout(() => {
+      void pollTask();
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [authToken, runNowTask?.task_id, runNowTask?.status]);
 
   const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -501,6 +576,10 @@ export default function App() {
       showToast("请先登录", true);
       return;
     }
+    if (runNowInFlight) {
+      showToast("已有任务正在执行，请稍候", true);
+      return;
+    }
     const keywordsList = parseKeywordRows(settingsForm.keyword_rows);
     if (!keywordsList.length) {
       showToast("关键词组不能为空", true);
@@ -508,13 +587,13 @@ export default function App() {
     }
     setBusy("run-now", true);
     try {
-      const data = await apiRequest<TriggerResponse>("/push/run-now", {
+      const data = await apiRequest<RunNowSubmitResponse>("/push/run-now", {
         method: "POST",
         body: { keywords_list: keywordsList },
         token: authToken,
       });
-      showToast(data.message || "推送任务已执行");
-      await loadDashboardData(authToken);
+      setRunNowTask(data.task);
+      showToast(data.message || "推送任务已提交");
     } catch (error) {
       showToast(errorMessage(error), true);
     } finally {
@@ -594,6 +673,7 @@ export default function App() {
       setPapers([]);
       setFeedbackItems([]);
       setFeedbackContent("");
+      setRunNowTask(null);
       setBusy("logout", false);
       showToast("已退出登录");
     }
@@ -768,6 +848,7 @@ export default function App() {
             <div>
               <p className="eyebrow"> 你的智能论文追踪助手</p>
               <h2>欢迎回来，{user?.username}</h2>
+              <p className="subline">反馈接收邮箱：{senderEmail || "未配置"}</p>
             </div>
             <button className="ghost" onClick={handleLogout} disabled={isBusy("logout")}>
               {isBusy("logout") ? "退出中..." : "退出登录"}
@@ -809,10 +890,41 @@ export default function App() {
                   <button className="primary" onClick={handleSaveSettings} disabled={isBusy("save-settings")}>
                     {isBusy("save-settings") ? "保存中..." : "保存配置"}
                   </button>
-                  <button className="warn" onClick={handleRunNow} disabled={isBusy("run-now")}>
-                    {isBusy("run-now") ? "执行中..." : "立即执行一次推送"}
+                  <button
+                    className="warn"
+                    onClick={handleRunNow}
+                    disabled={isBusy("run-now") || runNowInFlight}
+                  >
+                    {isBusy("run-now")
+                      ? "提交中..."
+                      : runNowInFlight
+                        ? "后台执行中..."
+                        : "立即执行一次推送"}
                   </button>
                 </div>
+                {runNowTask ? (
+                  <div className={`task-progress task-${runNowTask.status}`}>
+                    <strong>
+                      任务状态：
+                      {runNowTask.status === "queued"
+                        ? "排队中"
+                        : runNowTask.status === "running"
+                          ? "执行中"
+                          : runNowTask.status === "success"
+                            ? "已完成"
+                            : runNowTask.status === "failed"
+                              ? "失败"
+                              : runNowTask.status}
+                    </strong>
+                    <span>
+                      {runNowTask.status === "success"
+                        ? runNowTask.result_message || "推送完成"
+                        : runNowTask.status === "failed"
+                          ? runNowTask.error_message || "执行失败"
+                          : runNowTask.progress_message || "任务执行中"}
+                    </span>
+                  </div>
+                ) : null}
               </article>
 
               <article className="action-group">

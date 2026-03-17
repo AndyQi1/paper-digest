@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time, os
 import datetime as dt
+from collections.abc import Callable
 from typing import Any, List, Optional
 from app.paper_digest.rendering import *
 from app.paper_digest.core_utils import (
@@ -44,6 +45,7 @@ def run_once(
     persist_state_to_file: bool = True,
     profile: str = "",  # 用户搜索需求
     dispatch_run_type: str = "scheduled",
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> None:
     """
     run_once 的 Docstring
@@ -70,8 +72,20 @@ def run_once(
     :type persist_state_to_file: bool
     :param dispatch_run_type: 调度来源类型（如 scheduled/manual_digest），用于控制去重策略。
     :type dispatch_run_type: str
+    :param progress_callback: 进度回调，参数为 (stage, message)。
+    :type progress_callback: Callable[[str, str], None] | None
     """
+
+    def _report_progress(stage: str, message: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(str(stage or "").strip(), str(message or "").strip())
+        except Exception:
+            logger.debug("progress callback failed stage=%s", stage, exc_info=True)
+
     # 1) 读取配置与运行上下文
+    _report_progress("init", "初始化任务配置中")
     cfg = load_config(config_path)
     config_dir = os.path.dirname(os.path.abspath(config_path))
 
@@ -229,6 +243,7 @@ def run_once(
             _log(
                 f"[INFO] Daily send guard: email already sent on {last_email_date}; skip sending again today."
             )
+            _report_progress("skip", "今日已发送过定时邮件，跳过执行")
             return
     crossref_cfg = sources_cfg.get("crossref") or {}
     arxiv_cfg = sources_cfg.get("arxiv") or {}
@@ -240,8 +255,13 @@ def run_once(
     _log(
         f"[INFO] Run date: {run_date.isoformat()} | Window: {since.isoformat()} ~ {until.isoformat()} | Keywords list: {keywords_list}"
     )
+    _report_progress(
+        "search_window",
+        f"开始检索近 {days_back} 天论文（关键词组 {len(keywords_list or [])}）",
+    )
 
     if bool(arxiv_cfg.get("enabled", True)):
+        _report_progress("search_arxiv", "arXiv 搜索中")
         _log("[INFO] Source enabled: arXiv")
         try:
             results = search_arxiv(
@@ -250,10 +270,13 @@ def run_once(
             )
             _log(f"[INFO] arXiv '{keywords_list}' -> {len(results)}")
             all_papers.extend(results)
+            _report_progress("search_arxiv", f"arXiv 完成，命中 {len(results)} 篇")
         except Exception as e:
             print(f"[WARN] arXiv搜索失败：{keywords_list} -> {e}")
+            _report_progress("search_arxiv", "arXiv 搜索失败，继续后续数据源")
 
     if bool(crossref_cfg.get("enabled", True)):
+        _report_progress("search_crossref", "Crossref 搜索中")
         _log("[INFO] Source enabled: Crossref")
         try:
             results = search_crossref(
@@ -267,10 +290,13 @@ def run_once(
             )
             _log(f"[INFO] Crossref '{keywords_list}' -> {len(results)}")
             all_papers.extend(results)
+            _report_progress("search_crossref", f"Crossref 完成，命中 {len(results)} 篇")
         except Exception as e:
             print(f"[WARN] Crossref搜索失败：{keywords_list} -> {e}")
+            _report_progress("search_crossref", "Crossref 搜索失败，继续后续数据源")
 
     if bool(pubmed_cfg.get("enabled", True)):
+        _report_progress("search_pubmed", "PubMed 搜索中")
         _log("[INFO] Source enabled: PubMed")
         rows = int(pubmed_cfg.get("rows") or max_per_keyword)
         pm_email = (pubmed_cfg.get("email") or "").strip()
@@ -290,8 +316,10 @@ def run_once(
             )
             _log(f"[INFO] PubMed '{keywords_list}' -> {len(results)}")
             all_papers.extend(results)
+            _report_progress("search_pubmed", f"PubMed 完成，命中 {len(results)} 篇")
         except Exception as e:
             print(f"[WARN] PubMed搜索失败：{keywords_list} -> {e}")
+            _report_progress("search_pubmed", "PubMed 搜索失败，继续后续流程")
 
     # if bool(ieee_cfg.get("enabled", True)):
     #     ieee_api_key = (ieee_cfg.get("api_key") or "").strip()
@@ -324,6 +352,7 @@ def run_once(
     #             time.sleep(0.34)
 
     # 6) 全源聚合去重：同一论文按 UID 合并，并汇总关键词
+    _report_progress("merge", "聚合去重中")
     merged: dict[str, Paper] = {}
     for p in all_papers:
         uid = _paper_uid(p)
@@ -382,6 +411,7 @@ def run_once(
             continue
         available_papers.append(p)
     logger.info(f"llm筛选前论文数量={len(available_papers)}")
+    _report_progress("llm_rerank", "大模型偏好筛选中")
     try:
         available_papers, _ = llm_preference_rerank(available_papers, profile)
     except Exception as e:
@@ -404,6 +434,10 @@ def run_once(
     if ss_enabled:
         api_key = (ss_cfg.get("api_key") or "").strip()
     enriched: list[Paper] = []
+    if ss_enabled:
+        _report_progress("semantic_enrich", "论文信息补全中（Semantic Scholar）")
+    else:
+        _report_progress("semantic_enrich", "跳过 Semantic Scholar 补全")
     for p in available_papers:
         if ss_enabled:
             try:
@@ -428,12 +462,21 @@ def run_once(
         if LLMClient is None:
 
             print(f"[WARN] 未能导入 llm_tools.LLMClient，已跳过中文总结。")
+            _report_progress("llm_summary", "未加载 LLMClient，跳过中文总结")
         else:
+            _report_progress(
+                "llm_summary",
+                f"大模型分析总结中（共 {min(summarize_limit, len(enriched))} 篇）",
+            )
             for idx, p in enumerate(enriched):
                 if idx >= summarize_limit:
                     break
                 uid = _paper_uid(p)
                 try:
+                    _report_progress(
+                        "llm_summary",
+                        f"大模型分析总结中（{idx + 1}/{min(summarize_limit, len(enriched))}）",
+                    )
                     _log(
                         f"[INFO] Summarizing (LLM) {idx+1}/{min(summarize_limit, len(enriched))}: {p.title[:80]}"
                     )
@@ -443,7 +486,10 @@ def run_once(
                 except Exception as e:
                     print(f"[WARN] LLM总结失败：{p.title[:60]} -> {e}")
                 time.sleep(0.5)
+    else:
+        _report_progress("llm_summary", "跳过大模型总结")
 
+    _report_progress("render_email", "整理邮件内容中")
     subject, text_body, html_body = build_email(run_date, enriched, summaries)
 
     if dry_run:
@@ -454,10 +500,13 @@ def run_once(
     email_sent = False
     if no_email:
         print("[INFO] no_email=True, content generated but email not sent.")
+        _report_progress("skip_email", "仅生成内容，未发送邮件")
     else:
+        _report_progress("send_email", "邮件发送中")
         send_email(email_cfg, subject, text_body, html_body)
         print(f"[OK] 已发送邮件：{_safe_join(email_cfg.get('to') or [])}")
         email_sent = True
+        _report_progress("send_email", "邮件发送完成")
 
     # 9) 发送成功后更新状态（去重集合 + 推送历史）
     if not email_sent:
@@ -499,6 +548,8 @@ def run_once(
         # 仅文件模式写回 JSON；数据库模式由外层服务持久化 state_override。
         if persist_state_to_file and state_override is None:
             _save_json(state_path, state)
+
+        _report_progress("completed", "推送执行完成")
 
 
 def build_parser() -> argparse.ArgumentParser:

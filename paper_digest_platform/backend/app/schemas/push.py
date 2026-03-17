@@ -16,6 +16,25 @@ class RunNowRequest(BaseModel):
     keywords_list: list[list[str]] | None = Field(default=None)
 
 
+class RunNowTaskStatus(BaseModel):
+    task_id: str
+    run_type: str
+    status: str
+    progress_stage: str
+    progress_message: str
+    result_message: str = ""
+    error_message: str = ""
+    created_at: str
+    updated_at: str
+    started_at: str = ""
+    finished_at: str = ""
+
+
+class RunNowSubmitResponse(BaseModel):
+    message: str
+    task: RunNowTaskStatus
+
+
 class DispatchLogItem(BaseModel):
     id: int
     run_type: str
